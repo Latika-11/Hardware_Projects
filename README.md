@@ -29,6 +29,3 @@ The MQ-3 sensor detects alcohol concentration from the driver's breath. If alcoh
 - GSM alert system
 - IoT integration
 - Real vehicle implementation
-
-## Project Status
-Circuit diagram and project images will be uploaded soon.
