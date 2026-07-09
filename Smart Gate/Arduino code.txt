@@ -1,0 +1,112 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Servo.h>
+
+// ---------- Pin definitions ----------
+#define SS_PIN   10   // RC522 SDA/SS
+#define RST_PIN  9    // RC522 RST
+#define SERVO_PIN 3   // Servo signal
+
+// ---------- Gate angles ----------
+#define GATE_CLOSED_ANGLE 0
+#define GATE_OPEN_ANGLE   90
+#define GATE_OPEN_TIME_MS 5000  // how long the gate stays open
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+Servo gateServo;
+
+// ---------- Authorized RFID UID(s) ----------
+// Add your own tag's UID here (check Serial Monitor on first scan to find it).
+byte authorizedUID[] = {0xDE, 0xAD, 0xBE, 0xEF}; // <-- replace with your tag's real UID
+
+// ---------- State ----------
+bool gateOpen = false;
+
+void setup() {
+  Serial.begin(9600);
+  SPI.begin();
+  rfid.PCD_Init();
+
+  gateServo.attach(SERVO_PIN);
+  gateServo.write(GATE_CLOSED_ANGLE);
+
+  Serial.println("SmartGate ready.");
+  Serial.println("Scan RFID Card or send plate-match command from laptop.");
+}
+
+void loop() {
+  checkRFID();
+  checkSerialFromLaptop();
+}
+
+// ---------------------------------------------------------
+// 1) RFID check
+// ---------------------------------------------------------
+void checkRFID() {
+  // Look for a new card
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  Serial.print("Card UID: ");
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    Serial.print(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(rfid.uid.uidByte[i], HEX);
+  }
+  Serial.println();
+
+  if (isAuthorizedUID(rfid.uid.uidByte, rfid.uid.size)) {
+    Serial.println("Access Granted (RFID)");
+    openGate();
+  } else {
+    Serial.println("Access Denied - Unauthorized RFID");
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+bool isAuthorizedUID(byte *scannedUID, byte size) {
+  if (size != sizeof(authorizedUID)) return false;
+  for (byte i = 0; i < size; i++) {
+    if (scannedUID[i] != authorizedUID[i]) return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------
+// 2) Serial check (commands sent from the Python plate-recognition script)
+//    Expected commands (newline-terminated):
+//      "ACCESS_GRANTED"  -> open gate (plate matched pre-approved list)
+//      "ACCESS_DENIED"   -> just log, keep gate closed
+// ---------------------------------------------------------
+void checkSerialFromLaptop() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command == "ACCESS_GRANTED") {
+      Serial.println("Access Granted (Number Plate)");
+      openGate();
+    } else if (command == "ACCESS_DENIED") {
+      Serial.println("Access Denied - Unregistered Plate");
+    }
+  }
+}
+
+// ---------------------------------------------------------
+// Gate control
+// ---------------------------------------------------------
+void openGate() {
+  if (gateOpen) return; // already open, ignore repeat triggers
+
+  gateOpen = true;
+  gateServo.write(GATE_OPEN_ANGLE);
+  Serial.println("Gate Opening...");
+
+  delay(GATE_OPEN_TIME_MS);
+
+  gateServo.write(GATE_CLOSED_ANGLE);
+  gateOpen = false;
+  Serial.println("Gate Closed.");
+}
