@@ -1,0 +1,398 @@
+import cv2
+import easyocr
+import numpy as np
+import re
+import os
+import csv
+import threading
+import queue
+import warnings
+from datetime import datetime
+import serial
+import time
+from ultralytics import YOLO
+
+warnings.filterwarnings("ignore")
+
+# ══════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════
+SAVE_DIR      = "extracted_plates"
+CSV_LOG       = "plate_log.csv"
+DETECT_EVERY  = 2
+MIN_HITS      = 2
+MAX_MISSES    = 20
+MIN_CONF      = 0.15
+SAVE_CONF     = 0.80
+
+INDIAN_PLATE_RE = re.compile(r'^([A-Z]{2})([0-9]{2})([A-Z]{1,2})([0-9]{4})$')
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+VALID_STATE_CODES = {
+    'AN','AP','AR','AS','BR','CH','CG','DD','DL','DN',
+    'GA','GJ','HR','HP','JH','JK','KA','KL','LA','LD',
+    'MH','ML','MN','MP','MZ','NL','OD','PB','PY','RJ',
+    'SK','TN','TS','TR','UK','UP','WB'
+}
+
+DIGIT_TO_LETTER = {'0':'O','1':'I','2':'Z','5':'S','6':'G','8':'B'}
+LETTER_TO_DIGIT = {'O':'0','I':'1','Z':'2','S':'5','G':'6','B':'8','D':'0'}
+
+# ══════════════════════════════════════════════════════════
+#  SERIAL SETUP
+# ══════════════════════════════════════════════════════════
+SERIAL_ON = False
+try:
+    pass
+    ser = serial.Serial('COM5', 9600, timeout=1)
+    time.sleep(2)
+    SERIAL_ON = True
+    print("[OK] FPGA Connected")
+except:
+    print("[WARNING] FPGA not connected")
+
+def send_to_fpga(plate, violation="R"):
+    if SERIAL_ON:
+        try:
+            data = f"{plate},{violation}\n"
+            ser.write(data.encode())
+            print(f"[FPGA] {data.strip()}")
+        except Exception as e:
+            print(f"[SERIAL ERROR] {e}")
+
+# ══════════════════════════════════════════════════════════
+#  MODELS
+# ══════════════════════════════════════════════════════════
+print("[LOADING] YOLO + EasyOCR...")
+model = YOLO("yolov8n.pt")
+reader = easyocr.Reader(['en'], gpu=False)
+print("[OK] Models ready!")
+
+def correct_plate(raw: str) -> str | None:
+    s = ''.join(filter(str.isalnum, raw.upper()))
+    if len(s) < 8 or len(s) > 10:
+        return None
+
+    for length in [10, 9, 8]:
+        for start in range(len(s) - length + 1):
+            chunk = s[start:start+length]
+            corrected = force_format(chunk)
+            if corrected:
+                return corrected
+    return None
+
+def force_format(s: str) -> str | None:
+    n = len(s)
+    if n not in (8, 9, 10):
+        return None
+
+    chars = list(s)
+    
+    # 0,1 → LETTERS (state)
+    for i in (0, 1):
+        if chars[i].isdigit():
+            chars[i] = DIGIT_TO_LETTER.get(chars[i], chars[i])
+        if not chars[i].isalpha():
+            return None
+
+    # 2,3 → DIGITS (district)
+    for i in (2, 3):
+        if chars[i].isalpha():
+            chars[i] = LETTER_TO_DIGIT.get(chars[i], chars[i])
+        if not chars[i].isdigit():
+            return None
+
+    # Last 4 → DIGITS (number)
+    for i in range(n-4, n):
+        if chars[i].isalpha():
+            chars[i] = LETTER_TO_DIGIT.get(chars[i], chars[i])
+        if not chars[i].isdigit():
+            return None
+
+    # Middle → LETTERS (series)
+    for i in range(4, n-4):
+        if chars[i].isdigit():
+            chars[i] = DIGIT_TO_LETTER.get(chars[i], chars[i])
+        if not chars[i].isalpha():
+            return None
+
+    result = ''.join(chars)
+    if not INDIAN_PLATE_RE.match(result):
+        return None
+
+    state = result[:2]
+    if state not in VALID_STATE_CODES:
+        return None
+
+    return result
+
+# ══════════════════════════════════════════════════════════
+#  CSV LOGGER
+# ══════════════════════════════════════════════════════════
+def init_csv():
+    if not os.path.exists(CSV_LOG):
+        with open(CSV_LOG, 'w', newline='') as f:
+            csv.writer(f).writerow(["Timestamp","Plate","Confidence","Format","Image"])
+
+init_csv()
+
+def log_plate(text, conf, img_path):
+    state = text[:2]; dist = text[2:4]; ser = text[4:-4]; num = text[-4:]
+    fmt = f"{state}-{dist}-{ser}-{num}"
+    with open(CSV_LOG, 'a', newline='') as f:
+        csv.writer(f).writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            text, f"{conf:.2f}", fmt, img_path
+        ])
+
+# ══════════════════════════════════════════════════════════
+#  PLATE TRACKER
+# ══════════════════════════════════════════════════════════
+class PlateTracker:
+    def __init__(self):
+        self.plates = {}
+        self.saved = set()
+
+    def update(self, detections):
+        seen = set()
+        for bbox, text, conf in detections:
+            seen.add(text)
+            if text in self.plates:
+                e = self.plates[text]
+                e['hits'] += 1
+                e['misses'] = 0
+                e['bbox'] = bbox
+                e['conf'] = max(e['conf'], conf)
+            else:
+                self.plates[text] = dict(hits=1, misses=0, bbox=bbox, conf=conf)
+
+        for text in list(self.plates):
+            if text not in seen:
+                self.plates[text]['misses'] += 1
+                if self.plates[text]['misses'] > MAX_MISSES:
+                    del self.plates[text]
+
+        return [(v['bbox'], k, v['conf'], v['hits']) 
+                for k, v in self.plates.items() 
+                if v['hits'] >= MIN_HITS and v['conf'] >= SAVE_CONF]
+
+    def needs_save(self, text):
+        return text not in self.saved
+
+    def mark_saved(self, text):
+        self.saved.add(text)
+
+tracker = PlateTracker()
+
+# ══════════════════════════════════════════════════════════
+#  OCR WORKER (FIXED)
+# ══════════════════════════════════════════════════════════
+ocr_in = queue.Queue(maxsize=2)
+ocr_out = queue.Queue(maxsize=2)
+
+def preprocess_roi(roi):
+    h, w = roi.shape[:2]
+    if w < 160:
+        scale = 160 / w
+        roi = cv2.resize(roi, (int(w*scale), int(h*scale)), cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
+    enhanced = clahe.apply(roi)
+    _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    return [roi, enhanced, otsu, cv2.bitwise_not(otsu)]
+
+def run_ocr(bbox, gray_roi):
+    best_text, best_conf = None, 0.0
+    for variant in preprocess_roi(gray_roi):
+        try:
+            results = reader.readtext(variant, detail=1, paragraph=False)
+            if not results: continue
+            raw = ''.join(t for _, t, c in results if c > MIN_CONF)
+            conf = float(np.mean([c for _, _, c in results]))
+            corrected = correct_plate(raw)
+            if corrected and conf > best_conf:
+                best_text = corrected
+                best_conf = conf
+        except:
+            continue
+    return (bbox, best_text, best_conf) if best_text and best_conf >= SAVE_CONF else None
+
+def ocr_worker():
+    while True:
+        item = ocr_in.get()
+        if item is None: break
+        results = []
+        for bbox, gray_roi, color_roi in item:
+            hit = run_ocr(bbox, gray_roi)
+            if hit:
+                results.append((hit[0], hit[1], hit[2], color_roi))
+        try:
+            ocr_out.put_nowait(results)
+        except:
+            pass
+
+threading.Thread(target=ocr_worker, daemon=True).start()
+
+# Helmet detection function
+def detect_helmet(frame):
+    results = model(frame, conf=0.5, verbose=False)[0]
+    violation = False
+    
+    for box in results.boxes:
+        if int(box.cls) == 0:  # person
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            head = frame[y1:y1+80, x1:x2]
+            if head.size > 0:
+                gray_head = cv2.cvtColor(head, cv2.COLOR_BGR2GRAY)
+                if np.mean(gray_head) < 100:  # Dark = helmet
+                    cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
+                    cv2.putText(frame,"HELMET ✓",(x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
+                else:
+                    cv2.rectangle(frame, (x1,y1),(x2,y2),(0,0,255),2)
+                    cv2.putText(frame,"NO HELMET ✗",(x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+                    violation = True
+                break
+    return violation
+
+# Rest of the functions (extract_candidates, save_plate_image, draw functions) remain same...
+def extract_candidates(gray):
+    fh, fw = gray.shape
+    candidates = []
+    blur = cv2.GaussianBlur(gray,(5,5),0)
+    edged = cv2.Canny(blur, 20, 150)
+    cnts, _ = cv2.findContours(edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    for c in sorted(cnts, key=cv2.contourArea, reverse=True)[:60]:
+        if cv2.contourArea(c) < 200: continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02*peri, True)
+        x,y,w,h = cv2.boundingRect(approx)
+        ar = w/float(h) if h>0 else 0
+        if 1.5<=ar<=7.5 and 50<w<fw*0.85 and 12<h<fh*0.3:
+            candidates.append((x,y,w,h))
+    return candidates[:20]
+
+def save_plate_image(text, color_roi, conf):
+    state = text[:2]; dist = text[2:4]; ser = text[4:-4]; num = text[-4:]
+    formatted = f"{state}-{dist}-{ser}-{num}"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{SAVE_DIR}/{text}_{ts}.jpg"
+    
+    h, w = color_roi.shape[:2]
+    if w < 300:
+        color_roi = cv2.resize(color_roi,(300, int(300*h/w)), cv2.INTER_CUBIC)
+    
+    card = np.zeros((color_roi.shape[0]+70, max(color_roi.shape[1], 380), 3), dtype=np.uint8)
+    card[:color_roi.shape[0], :color_roi.shape[1]] = color_roi
+    
+    badge_color = (0,200,80) if conf >= 0.90 else (0,180,255)
+    cv2.rectangle(card, (0, color_roi.shape[0]), (card.shape[1], card.shape[0]), (15,15,15), -1)
+    cv2.putText(card, formatted, (8, color_roi.shape[0]+28), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255,255,255), 2)
+    cv2.putText(card, f"CONF: {conf:.0%}", (8, color_roi.shape[0]+56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, badge_color, 2)
+    cv2.imwrite(filename, card)
+    log_plate(text, conf, filename)
+    print(f"[SAVED] {formatted} ({conf:.0%}) → {filename}")
+    return filename
+
+PALETTE = [(0,255,80),(0,200,255),(255,180,0),(255,60,180),(80,255,220)]
+
+def plate_color(text):
+    return PALETTE[hash(text) % len(PALETTE)]
+
+def draw_plate_box(frame, bbox, text, conf, hits):
+    x,y,w,h = bbox
+    col = plate_color(text)
+    state=text[:2]; dist=text[2:4]; ser=text[4:-4]; num=text[-4:]
+    formatted = f"{state}-{dist}-{ser}-{num}"
+
+    cv2.rectangle(frame,(x-2,y-2),(x+w+2,y+h+2), tuple(c//3 for c in col), 4)
+    cv2.rectangle(frame,(x,y),(x+w,y+h), col, 2)
+
+    label = f" {formatted}  {conf:.0%} "
+    (tw,th_),_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.72, 2)
+    cv2.rectangle(frame,(x,y-th_-14),(x+tw+6,y), col, -1)
+    cv2.putText(frame, label,(x+3,y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.72,(0,0,0),2)
+
+    bar_w = min(hits*8, w)
+    cv2.rectangle(frame,(x,y+h+3),(x+bar_w,y+h+8), col,-1)
+
+def draw_hud(frame, confirmed, saved_count, helmet_violation):
+    h_f, w_f = frame.shape[:2]
+    hud_text = f"HELMET: {'VIOLATION ✗' if helmet_violation else 'OK ✓'} | Plates: {len(confirmed)} | Saved: {saved_count}"
+    cv2.rectangle(frame,(0,0),(w_f,52),(10,10,10),-1)
+    cv2.putText(frame, hud_text,(14,36), cv2.FONT_HERSHEY_SIMPLEX,0.88,(0,255,80),2)
+
+# ══════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ══════════════════════════════════════════════════════════
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+frame_idx = 0
+confirmed = []
+saved_count = 0
+
+print("[INFO] Starting Smart Traffic System...")
+print("Format: AA-99-AA-9999 (Indian plates only)")
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    
+    frame = cv2.resize(frame, (1280, 720))
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame_idx += 1
+
+    # YOLO HELMET DETECTION
+    helmet_violation = detect_helmet(frame)
+
+    # Collect OCR results (FIXED LINE 114+)
+    raw_detections = []
+    try:
+        while not ocr_out.empty():
+            batch = ocr_out.get_nowait()
+            for bbox, text, conf, color_roi in batch:
+                raw_detections.append((bbox, text, conf))
+                if tracker.needs_save(text):
+                    save_plate_image(text, color_roi, conf)
+                    tracker.mark_saved(text)
+                    saved_count += 1
+                    # Send to FPGA with violation status
+                    violation = "H" if helmet_violation else "R"
+                    send_to_fpga(text, violation)
+    except:
+        pass
+
+    confirmed = tracker.update(raw_detections)
+
+    # Dispatch OCR
+    if frame_idx % DETECT_EVERY == 0 and ocr_in.empty():
+        candidates = extract_candidates(gray)
+        if candidates:
+            batch = []
+            for (x,y,w,h) in candidates:
+                gray_roi = gray[y:y+h, x:x+w]
+                color_roi = frame[y:y+h, x:x+w].copy()
+                if gray_roi.size > 0:
+                    batch.append(((x,y,w,h), gray_roi, color_roi))
+            if batch:
+                try:
+                    ocr_in.put_nowait(batch)
+                except:
+                    pass
+
+    # Draw everything
+    for bbox, text, conf, hits in confirmed:
+        draw_plate_box(frame, bbox, text, conf, hits)
+    draw_hud(frame, confirmed, saved_count, helmet_violation)
+
+    cv2.imshow("🚦 SMART TRAFFIC SYSTEM 🚦", frame)
+    
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'): break
+
+ocr_in.put(None)
+cap.release()
+cv2.destroyAllWindows()
+if SERIAL_ON: ser.close()
+print(f"\n[DONE] Plates saved: {saved_count}")
